@@ -1,0 +1,2 @@
+[orange_pi_zero]
+192.168.1.63 ansible_user=poddingue ansible_become_pass="{{ ansible_become_pass }}"

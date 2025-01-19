@@ -1,0 +1,144 @@
+---
+- name: Configure Orange Pi Zero as a router with dynamic USB tethering
+  hosts: orange_pi_zero
+  become: yes
+  vars_files:
+    - vault.yml
+  vars:
+    ethernet_interface: "end0"
+    dhcp_range_start: "192.168.2.100"
+    dhcp_range_end: "192.168.2.200"
+    dhcp_subnet: "192.168.2.0"
+    dhcp_netmask: "255.255.255.0"
+    dhcp_gateway: "192.168.2.1"
+    dns_servers: "8.8.8.8, 8.8.4.4"
+
+  tasks:
+    - name: Update and upgrade packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Install required packages
+      apt:
+        name:
+          - isc-dhcp-server
+          - iptables
+          - net-tools
+        state: present
+
+    - name: Enable IP forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: 1
+        state: present
+        reload: yes
+
+    - name: Configure DHCP server
+      copy:
+        dest: /etc/dhcp/dhcpd.conf
+        content: |
+          default-lease-time 600;
+          max-lease-time 7200;
+          subnet {{ dhcp_subnet }} netmask {{ dhcp_netmask }} {
+              range {{ dhcp_range_start }} {{ dhcp_range_end }};
+              option routers {{ dhcp_gateway }};
+              option domain-name-servers {{ dns_servers }};
+          }
+
+    - name: Configure DHCP server to listen on the Ethernet interface
+      lineinfile:
+        path: /etc/default/isc-dhcp-server
+        regexp: '^INTERFACESv4='
+        line: 'INTERFACESv4="{{ ethernet_interface }}"'
+        state: present
+
+    - name: Restart DHCP server
+      service:
+        name: isc-dhcp-server
+        state: restarted
+        enabled: yes
+
+    - name: Create USB tethering configuration script
+      copy:
+        dest: /usr/local/bin/configure-usb-tethering.sh
+        content: |
+          #!/bin/bash
+          # Detect the USB tethering interface
+          USB_IFACE=$(ip link show | grep -oP 'enx[^:]+' | head -n 1)
+          if [ -z "$USB_IFACE" ]; then
+              echo "No USB tethering interface found."
+              exit 1
+          fi
+          echo "USB tethering interface detected: $USB_IFACE"
+
+          # Bring up the interface and configure it with DHCP
+          sudo ip link set $USB_IFACE up
+          sudo dhclient -v $USB_IFACE
+
+          # Wait for DHCP to assign an IP address
+          sleep 5
+
+          # Get the default gateway provided by the phone
+          GATEWAY=$(ip route | grep default | grep $USB_IFACE | awk '{print $3}')
+          if [ -z "$GATEWAY" ]; then
+              echo "Failed to detect the default gateway."
+              exit 1
+          fi
+          echo "Default gateway: $GATEWAY"
+
+          # Remove existing default routes
+          sudo ip route del default via 192.168.1.254 dev wlan0 2>/dev/null || true
+
+          # Add default routes with adjusted metrics
+          sudo ip route add default via $GATEWAY dev $USB_IFACE metric 100
+          sudo ip route add default via 192.168.1.254 dev wlan0 metric 600
+
+          # Configure NAT and routing
+          sudo iptables -t nat -A POSTROUTING -o $USB_IFACE -j MASQUERADE
+          sudo iptables -A FORWARD -i {{ ethernet_interface }} -o $USB_IFACE -j ACCEPT
+          sudo iptables -A FORWARD -i $USB_IFACE -o {{ ethernet_interface }} -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+          # Save iptables rules
+          sudo iptables-save | sudo tee /etc/iptables/rules.v4
+
+          echo "USB tethering configuration complete."
+        mode: '0755'
+
+    - name: Create systemd service for USB tethering configuration
+      copy:
+        dest: /etc/systemd/system/usb-tethering.service
+        content: |
+          [Unit]
+          Description=Configure USB Tethering
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/local/bin/configure-usb-tethering.sh
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start USB tethering service
+      service:
+        name: usb-tethering
+        state: started
+        enabled: yes
+
+    - name: Ensure Ethernet interface is up
+      command: ip link set {{ ethernet_interface }} up
+
+    - name: Check if IP address is already assigned to Ethernet interface
+      shell: ip addr show {{ ethernet_interface }} | grep -q "inet {{ dhcp_gateway }}/24"
+      ignore_errors: yes
+      register: ip_assigned
+
+    - name: Set static IP for Ethernet interface (if not already assigned)
+      command: ip addr add {{ dhcp_gateway }}/24 dev {{ ethernet_interface }}
+      when: not ip_assigned.rc == 0
+
+  handlers:
+    - name: Save iptables rules
+      command: iptables-save > /etc/iptables/rules.v4
+
